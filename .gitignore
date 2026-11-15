@@ -1,0 +1,3 @@
+.env
+# Windows の Git Bash が強制終了したときに残すクラッシュダンプ
+*.stackdump

@@ -1,0 +1,4 @@
+# コンテナの中で動くので LF に固定する (Windows の core.autocrlf=true だと CRLF で取り出され、bash/tmux が読めなくなる)
+*.sh text eol=lf
+*.conf text eol=lf
+session/bin/** text eol=lf

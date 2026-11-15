@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# tmux のペインごとに、そこで動いている Claude Code の会話を覚えておき、
+# tmux-resurrect の復元後にそのペインで再開する。
+#
+#   claude-pane hook          Claude Code の SessionStart フック (stdin に JSON)。ペインに記録し、対応表を書き出す
+#   claude-pane end           Claude Code の SessionEnd フック。利用者が自分で終了したときだけ記録を消す
+#   claude-pane save          対応表を書き出す (resurrect の post-save-all と hook から呼ぶ)
+#   claude-pane pre-restore   resurrect の pre-restore-all。復元中の旗を立てる
+#   claude-pane restore       resurrect の post-restore-all。対応表の各ペインで claude を起動し、旗を下ろす
+#   claude-pane restoring     復元中なら 0 で終わる (保存してよいかの判定用)
+#   claude-pane check         claude が動いているのに記録が付かないペインを探して警告する (定期的に呼ぶ)
+#
+# 記録はペインオプション (@claude_*) に置く。tmux サーバーと一緒に消えるので、
+# コンテナを起動し直したときに古い記録が新しいペインに当たることがない。
+# 位置 (session:window.pane) 基準の対応表だけをファイルに置く。
+set -u
+
+# ---- 設定 ---------------------------------------------------------------
+# 保存して復元時に戻す環境変数。拡張正規表現で、名前全体に一致したものだけ残す。
+# トークンなどの秘密は入れないこと (対応表とペインオプションに平文で残る)。
+KEEP_ENV='RC_[A-Za-z0-9_]*|CLAUDE_MODEL|CLAUDE_CONFIG_DIR'
+# KEEP_ENV に一致しても、名前がこちらにも一致したものは残さない (RC_HUB_TOKEN など)
+DROP_ENV='.*(TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL).*'
+
+STATE="${CLAUDE_PANE_STATE:-$HOME/.local/state/claude-pane}"
+MAP="$STATE/map"
+LOG="$STATE/log"
+PENDING_TTL=120 # 復元で起動を送ったペインを、フックが記録するまで対応表に残す秒数
+FLAG_TTL=600    # 復元中の旗の有効期限。復元が途中で止まっても保存が永久に止まらないように
+CHECK_GRACE=${CLAUDE_PANE_CHECK_GRACE:-60} # claude が起動してから、記録が無いと警告するまでの秒数
+# -------------------------------------------------------------------------
+
+US=$'\037'
+
+log() {
+  mkdir -p "$STATE"
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+}
+
+b64() { printf '%s' "$1" | base64 -w0; }
+unb64() { [ -n "$1" ] && printf '%s' "$1" | base64 -d; }
+
+# /proc/<pid>/stat の ppid と起動時刻。コマンド名に空白や括弧があっても崩れないよう ") " の後ろを読む
+ppid_of() { local s; s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; s=${s##*) }; set -- $s; printf '%s' "$2"; }
+start_of() { local s; s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; s=${s##*) }; set -- $s; printf '%s' "${20}"; }
+
+is_shell() {
+  case "${1#-}" in bash | sh | dash | zsh | fish | ksh) return 0 ;; esac
+  return 1
+}
+
+# フックから上にたどって、ペインのプロセスの直下にいる祖先 (= claude 本体) を探す。
+# claude がペインのプロセスそのもの (tmux new-window claude など) のときはペインのプロセスを返す。
+claude_pid() { # pane_pid
+  local pane_pid=$1 p=$$ pp
+  if ! is_shell "$(cat "/proc/$pane_pid/comm" 2>/dev/null)"; then
+    printf '%s' "$pane_pid"
+    return 0
+  fi
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    pp=$(ppid_of "$p") || return 1
+    if [ "$pp" = "$pane_pid" ]; then
+      printf '%s' "$p"
+      return 0
+    fi
+    p=$pp
+  done
+  return 1
+}
+
+json_str() { # key  (stdin の JSON から文字列値を 1 つ取り出す。session_id などの単純な値用)
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" <<<"$INPUT" | head -n1
+}
+
+quote_words() { # args... → %q で空白区切り
+  local out="" a
+  for a in "$@"; do out+=" $(printf '%q' "$a")"; done
+  printf '%s' "${out# }"
+}
+
+keep_env() { # pid → KEEP_ENV に一致し DROP_ENV に一致しない変数を NAME=%q 値 で空白区切り
+  local out="" kv
+  while IFS= read -r -d '' kv; do
+    [[ $kv =~ ^($KEEP_ENV)= ]] || continue
+    [[ ${kv%%=*} =~ ^($DROP_ENV)$ ]] && continue
+    out+=" ${kv%%=*}=$(printf '%q' "${kv#*=}")"
+  done <"/proc/$1/environ"
+  printf '%s' "${out# }"
+}
+
+# 非対話 (-p) とバックグラウンド起動は記録しない
+is_noninteractive() {
+  local a
+  for a in "$@"; do
+    case "$a" in -p | --print | --print=* | --bg | --background) return 0 ;; esac
+  done
+  return 1
+}
+
+# 復元に使う起動オプションの分類。
+#   keep0 値なし  keep1 値 1 つ  keepN 値を続けて取る  keepopt 値は任意
+#   drop* 同じ取り方で捨てる。会話の指定、非対話、起動のたびに何かを作るものなど
+# 知らないオプションは、直後の位置引数ごと捨てる (それが最初のプロンプトかもしれないため)。
+arg_kind() {
+  case "$1" in
+    --allow-dangerously-skip-permissions | --dangerously-skip-permissions | --ax-screen-reader | --bare | \
+      --brief | --chrome | --no-chrome | --disable-slash-commands | --exclude-dynamic-system-prompt-sections | \
+      --ide | --restricted | --safe-mode | --strict-mcp-config | --verbose | --no-session-persistence)
+      echo keep0 ;;
+    --agent | --agents | --append-system-prompt | --append-system-prompt-file | --system-prompt | \
+      --system-prompt-file | --autocompact | --debug-file | --effort | --fallback-model | --max-budget-usd | \
+      --model | -n | --name | --permission-mode | --permission-prompts | --plugin-dir | --plugin-url | \
+      --remote-control-session-name-prefix | --setting-sources | --settings | --system-prompt-snapshot)
+      echo keep1 ;;
+    --add-dir | --allowedTools | --allowed-tools | --betas | --disallowedTools | --disallowed-tools | \
+      --mcp-config | --tools)
+      echo keepN ;;
+    -d | --debug | --remote-control | --prompt-suggestions)
+      echo keepopt ;;
+    -c | --continue | --fork-session | -p | --print | --bg | --background | --desktop | --tmux | -h | --help | \
+      -v | --version | --include-hook-events | --include-partial-messages | --replay-user-messages | \
+      --forward-subagent-text)
+      echo drop0 ;;
+    --session-id | --environment | --input-format | --output-format | --json-schema)
+      echo drop1 ;;
+    --file)
+      echo dropN ;;
+    -r | --resume | --cloud | --from-pr | --teleport | -w | --worktree)
+      echo dropopt ;;
+    *) echo unknown ;;
+  esac
+}
+
+# argv[1..] → 復元に使う引数 (%q、先頭に空白付き)。位置引数 (最初のプロンプト) は決して残さない。
+filter_args() {
+  local out=() a name eq kind
+  while [ $# -gt 0 ]; do
+    a=$1
+    shift
+    case "$a" in
+      --) break ;; # 以降はすべて位置引数
+      --*=*) name=${a%%=*} eq=1 ;;
+      -?*) name=$a eq= ;;
+      *) continue ;; # 位置引数 = 最初のプロンプト
+    esac
+    kind=$(arg_kind "$name")
+    [ "$kind" = unknown ] && log "restore: unknown option dropped: $name"
+    case "$kind" in
+      keep0) out+=("$a") ;;
+      keep1)
+        out+=("$a")
+        if [ -z "$eq" ] && [ $# -gt 0 ]; then out+=("$1"); shift; fi ;;
+      keepN)
+        out+=("$a")
+        if [ -z "$eq" ]; then
+          while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do out+=("$1"); shift; done
+        fi ;;
+      keepopt)
+        out+=("$a")
+        if [ -z "$eq" ] && [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then out+=("$1"); shift; fi ;;
+      drop0) ;;
+      drop1)
+        if [ -z "$eq" ] && [ $# -gt 0 ]; then shift; fi ;;
+      dropN)
+        if [ -z "$eq" ]; then
+          while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do shift; done
+        fi ;;
+      dropopt | unknown)
+        if [ -z "$eq" ] && [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then shift; fi ;;
+    esac
+  done
+  [ ${#out[@]} -gt 0 ] && printf ' %q' "${out[@]}"
+}
+
+# 復元中か。旗は tmux のグローバルオプションに置く (tmux サーバーと一緒に消える)
+cmd_restoring() {
+  local t
+  t=$(tmux show -gqv @claude_pane_restoring 2>/dev/null)
+  [ -n "$t" ] && [ $(($(date +%s) - t)) -lt "$FLAG_TTL" ]
+}
+
+cmd_hook() {
+  [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || return 0
+  INPUT=$(cat)
+  local sid src cwd pane_pid pid start args env argv=()
+  sid=$(json_str session_id)
+  src=$(json_str source)
+  cwd=$(json_str cwd)
+  [ -n "$sid" ] || return 0
+  pane_pid=$(tmux display -p -t "$TMUX_PANE" '#{pane_pid}' 2>/dev/null) || return 0
+  pid=$(claude_pid "$pane_pid") || { log "hook: $TMUX_PANE: claude process not found"; return 0; }
+  mapfile -d '' argv <"/proc/$pid/cmdline"
+  is_noninteractive "${argv[@]:1}" && return 0
+  start=$(start_of "$pid")
+  args=$(quote_words "${argv[@]}")
+  env=$(keep_env "$pid")
+  [ -n "$cwd" ] || cwd=$(readlink "/proc/$pid/cwd")
+  tmux set -p -t "$TMUX_PANE" @claude_pid "$pid"
+  tmux set -p -t "$TMUX_PANE" @claude_start "$start"
+  tmux set -p -t "$TMUX_PANE" @claude_sid "$sid"
+  tmux set -p -t "$TMUX_PANE" @claude_cwd "$(b64 "$cwd")"
+  tmux set -p -t "$TMUX_PANE" @claude_args "$(b64 "$args")"
+  tmux set -p -t "$TMUX_PANE" @claude_env "$(b64 "$env")"
+  tmux set -pu -t "$TMUX_PANE" @claude_pending
+  log "hook: $TMUX_PANE source=$src sid=$sid pid=$pid"
+  cmd_save
+}
+
+# 位置基準の対応表を作り直す。載せるのは、保存の時点で生きている claude
+# (記録した pid がまだペインの子で、起動時刻も同じ) と、復元で起動を送ってまだ記録されていないペインだけ。
+cmd_save() {
+  if cmd_restoring; then
+    log "save: skipped (restoring)"
+    return 0
+  fi
+  # コンテナの停止中 (tmux-state final-save が旗を立てる) は、停止直前の 1 回 (CLAUDE_PANE_FINAL=1) だけ書く
+  if [ -z "${CLAUDE_PANE_FINAL:-}" ] && [ -n "$(tmux show -gqv @tmux_state_stopping 2>/dev/null)" ]; then
+    log "save: skipped (stopping)"
+    return 0
+  fi
+  mkdir -p "$STATE"
+  local tmp now n=0
+  tmp=$(mktemp "$STATE/map.XXXXXX") || return 1
+  now=$(date +%s)
+  local fmt="#{session_name}:#{window_index}.#{pane_index}${US}#{pane_pid}${US}#{@claude_pid}${US}#{@claude_start}"
+  fmt+="${US}#{@claude_sid}${US}#{@claude_cwd}${US}#{@claude_args}${US}#{@claude_env}${US}#{@claude_pending}"
+  local target pane_pid pid start sid cwd args env pending alive
+  while IFS=$US read -r target pane_pid pid start sid cwd args env pending; do
+    [ -n "$sid" ] || continue
+    alive=
+    if [ -n "$pid" ] && [ "$(start_of "$pid")" = "$start" ] &&
+      { [ "$pid" = "$pane_pid" ] || [ "$(ppid_of "$pid")" = "$pane_pid" ]; }; then
+      alive=1
+    elif [ -n "$pending" ] && [ $((now - pending)) -lt "$PENDING_TTL" ]; then
+      alive=1
+    fi
+    [ -n "$alive" ] || continue
+    printf '%s\n' "$target$US$sid$US$(unb64 "$cwd")$US$(unb64 "$args")$US$(unb64 "$env")" >>"$tmp"
+    n=$((n + 1))
+  done < <(tmux list-panes -a -F "$fmt" 2>/dev/null)
+  mv -f "$tmp" "$MAP"
+  # ログは最後の 1000 行だけ残す
+  if [ -f "$LOG" ] && [ "$(wc -l <"$LOG")" -gt 2000 ]; then
+    tail -n 1000 "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+  fi
+}
+
+cmd_pre_restore() {
+  tmux set -g @claude_pane_restoring "$(date +%s)"
+  log "pre-restore: flag set"
+}
+
+transcript_exists() { # sid config_dir
+  local dir=${2:-$HOME/.claude}
+  [ -n "$(find "$dir/projects" -mindepth 2 -maxdepth 2 -name "$1.jsonl" -print -quit 2>/dev/null)" ]
+}
+
+cmd_restore() {
+  local now target sid cwd args env cur pending pid bin cfg kept resume cmd argv envv kv
+  now=$(date +%s)
+  if [ -f "$MAP" ]; then
+    while IFS=$US read -r target sid cwd args env; do
+      if ! tmux display -p -t "$target" '' >/dev/null 2>&1; then
+        log "restore: $target: pane missing"
+        continue
+      fi
+      IFS=$US read -r cur pending pid < <(tmux display -p -t "$target" "#{pane_current_command}${US}#{@claude_pending}${US}#{@claude_pid}")
+      if ! is_shell "$cur" || [ -n "$pending$pid" ]; then
+        log "restore: $target: skipped (running $cur, pending=${pending:-} pid=${pid:-})"
+        continue
+      fi
+      eval "argv=($args)" # 自分で %q した文字列なので eval してよい
+      bin=${argv[0]:-claude}
+      case "$bin" in claude | */claude) ;; *) bin=claude ;; esac
+      kept=$(filter_args "${argv[@]:1}")
+      cfg=
+      eval "envv=($env)" # NAME=値 の並び。値は %q 済み
+      for kv in "${envv[@]}"; do
+        case "$kv" in CLAUDE_CONFIG_DIR=*) cfg=${kv#*=} ;; esac
+      done
+      if transcript_exists "$sid" "$cfg"; then
+        resume=" --resume $(printf '%q' "$sid")"
+      else
+        resume=
+        log "restore: $target: no transcript for $sid, starting a new conversation"
+      fi
+      # 先頭の空白は bash の履歴に残さないため、末尾の空白は tmux が末尾の ; を区切りと読まないため
+      cmd=" cd $(printf '%q' "$cwd") && ${env:+$env }$(printf '%q' "$bin")$kept$resume "
+      tmux set -p -t "$target" @claude_pending "$now"
+      tmux set -p -t "$target" @claude_sid "$sid"
+      tmux set -p -t "$target" @claude_cwd "$(b64 "$cwd")"
+      tmux set -p -t "$target" @claude_args "$(b64 "$args")"
+      tmux set -p -t "$target" @claude_env "$(b64 "$env")"
+      tmux send-keys -t "$target" -l "$cmd"
+      tmux send-keys -t "$target" Enter
+      log "restore: $target: started sid=$sid${resume:+ (resume)}"
+    done <"$MAP"
+  fi
+  tmux set -gu @claude_pane_restoring
+  tmux set -g @restore-finished 1
+  log "restore: done"
+}
+
+# SessionEnd フック。利用者が自分で終了したとき (prompt_input_exit) だけ、このペインの記録を消して
+# 対応表を書き直す (直後に落ちても claude を戻さないため)。
+# それ以外では何もしない: clear・resume は直後の SessionStart が記録を差し替える。other (シグナルなど) は
+# コンテナの停止やハングで落ちた場合で、記録を残して次の起動で戻す。
+cmd_end() {
+  [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || return 0
+  INPUT=$(cat)
+  local reason sid
+  reason=$(json_str reason)
+  sid=$(json_str session_id)
+  if [ "$reason" != prompt_input_exit ]; then
+    log "end: $TMUX_PANE reason=${reason:-?} sid=$sid (kept)"
+    return 0
+  fi
+  # 記録が別の会話に差し替わっていたら触らない
+  [ "$(tmux show -pqv -t "$TMUX_PANE" @claude_sid 2>/dev/null)" = "$sid" ] || return 0
+  local o
+  for o in @claude_pid @claude_start @claude_sid @claude_cwd @claude_args @claude_env @claude_pending; do
+    tmux set -pu -t "$TMUX_PANE" "$o" 2>/dev/null
+  done
+  log "end: $TMUX_PANE reason=$reason sid=$sid (record removed)"
+  cmd_save
+}
+
+# claude らしいプロセス (comm が claude、または argv[0] の名前が claude) を CLAUDE_OF に集める:
+# CLAUDE_OF[pid]=pid (自分がペインのプロセスのとき用)、CLAUDE_OF[ppid]=pid (シェルの子のとき用)。
+# ps を 1 回だけ呼ぶ (ペインの数だけ pgrep などを起動すると、100 ペインで 1 秒かかる)
+collect_claude() {
+  local pid ppid comm a0
+  declare -gA CLAUDE_OF=()
+  while read -r pid ppid comm a0; do
+    if [ "$comm" = claude ] || [ "${a0##*/}" = claude ]; then
+      CLAUDE_OF[$pid]=$pid
+      [ -n "${CLAUDE_OF[$ppid]:-}" ] || CLAUDE_OF[$ppid]=$pid
+    fi
+  done < <(ps -eo pid=,ppid=,comm=,args= 2>/dev/null)
+}
+
+# フックが動いていないことに気づくための見張り。claude が CHECK_GRACE 秒動いているのに
+# SessionStart の記録が付かないペインがあれば、ログに残し、attach している端末に一度だけ知らせ、
+# グローバルオプション @claude_pane_warn に位置を並べる (tmux.conf がステータス行に出す)。
+# 管理者用設定が無視された (組織のサーバー管理設定が優先された等)、--bare で起動した、などで起きる。
+cmd_check() {
+  local now fmt warn=() target pane_id pane_pid rec pending seen seen_pid warned cp argv=()
+  now=$(date +%s)
+  collect_claude
+  fmt="#{session_name}:#{window_index}.#{pane_index}${US}#{pane_id}${US}#{pane_pid}${US}#{@claude_pid}"
+  fmt+="${US}#{@claude_pending}${US}#{@claude_seen}${US}#{@claude_seen_pid}${US}#{@claude_warned}"
+  while IFS=$US read -r target pane_id pane_pid rec pending seen seen_pid warned; do
+    cp=${CLAUDE_OF[$pane_pid]:-} # ペインのプロセスそのものが claude か、その子の claude
+    if [ -z "$cp" ] || [ "$cp" = "$rec" ]; then
+      [ -n "$seen" ] && tmux set -pu -t "$pane_id" @claude_seen \; set -pu -t "$pane_id" @claude_seen_pid
+      continue
+    fi
+    [ -n "$pending" ] && [ $((now - pending)) -lt "$PENDING_TTL" ] && continue
+    mapfile -d '' argv <"/proc/$cp/cmdline" 2>/dev/null
+    is_noninteractive "${argv[@]:1}" && continue
+    if [ "$seen_pid" != "$cp" ]; then
+      tmux set -p -t "$pane_id" @claude_seen "$now" \; set -p -t "$pane_id" @claude_seen_pid "$cp"
+      continue
+    fi
+    [ $((now - seen)) -ge "$CHECK_GRACE" ] || continue
+    warn+=("$target")
+    if [ "$warned" != "$cp" ]; then
+      tmux set -p -t "$pane_id" @claude_warned "$cp"
+      log "WARN: $target: claude (pid $cp) has run ${CHECK_GRACE}s+ without a SessionStart record." \
+        "Its conversation will not be restored. Are the hooks in /etc/claude-code/managed-settings.d loaded?"
+      local c
+      for c in $(tmux list-clients -F '#{client_name}' 2>/dev/null); do
+        tmux display-message -c "$c" -d 15000 \
+          "claude-pane: $target の claude の会話が記録されていません (フックが動いていない可能性)。~/.local/state/claude-pane/log を参照" 2>/dev/null
+      done
+    fi
+  done < <(tmux list-panes -a -F "$fmt" 2>/dev/null)
+  if [ ${#warn[@]} -gt 0 ]; then
+    tmux set -g @claude_pane_warn "${warn[*]}"
+  elif [ -n "$(tmux show -gqv @claude_pane_warn 2>/dev/null)" ]; then
+    tmux set -gu @claude_pane_warn
+  fi
+}
+
+case "${1:-}" in
+  hook) cmd_hook ;;
+  end) cmd_end ;;
+  check) cmd_check ;;
+  save) cmd_save ;;
+  pre-restore) cmd_pre_restore ;;
+  restore) cmd_restore ;;
+  restoring) cmd_restoring ;;
+  *)
+    echo "usage: claude-pane hook|end|check|save|pre-restore|restore|restoring" >&2
+    exit 2 ;;
+esac
+exit_code=$?
+case "${1:-}" in hook | end) exit 0 ;; esac # フックは決して claude を止めない
+exit $exit_code

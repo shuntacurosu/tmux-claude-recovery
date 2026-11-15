@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# tmux の状態の保存。すべての保存 (entrypoint の毎秒の見回り、tmux フック、prefix + C-s) はここを通る。
+#
+#   tmux-state save            保存する。ただし復元中・停止中は何もしない。
+#                              ほかの保存が走っていれば重ねず、その保存が終わった後にもう 1 回まとめて保存させる
+#   tmux-state final-save      コンテナ停止の直前に 1 回だけ全部保存し、以後の保存を止める (entrypoint の SIGTERM 処理から)
+#   tmux-state prepare-restore 起動時、復元の前に呼ぶ。last を確かめ (壊れていれば中身のある保存に向け直す)、
+#                              ペインごとの画面の文字をまとめて resurrect が読む形 (pane_contents.tar.gz) にする
+#   tmux-state blocked         復元中または停止中なら 0 で終わる
+#
+# 保存するものは 2 つで、頻度が違う。
+#   構成    セッション・ウィンドウ・ペインの並び、作業 dir、名前など。tmux list-panes / list-windows を 1 回ずつ読み、
+#           resurrect と同じ形式のファイル (tmux_resurrect_*.txt と last) に書く。変わったときだけ書く。
+#           (resurrect の save.sh はペインごとに ps を呼ぶので、100 ペインで構成だけでも約 1.7 秒かかる)
+#   画面    各ペインに表示されている文字 (スクロールして見える分も含む)。前回から出力があったペイン
+#           (#{pane_output_generation} が変わったもの) だけ取り込む。ペインごとに 2 つのファイルに分けて置く:
+#             hist-<位置>.<時刻>    スクロールして画面の上に消えた行 (履歴)。#{history_added} を見て、増えた行だけを追記する
+#             screen-<位置>.<時刻>  いま見えている画面。毎回新しい名前で書く (数十行)
+#           履歴が消された・折り返しが変わった (#{history_generation} が変わった) ときは、履歴を取り込み直す。
+#           どのファイルの何バイトまでが確定かは索引 (pane_contents.idx) に書き、全ペイン分を rename 1 回で差し替える。
+#           復元の直前に、索引どおりに 2 つを繋げて resurrect の形 (pane_contents.tar.gz の pane-<位置>) にまとめる。
+#           tmux 3.8 以降が要る (書式が無い版では entrypoint が起動を止める)
+# 毎秒呼ばれるので、何も変わっていないときに外部コマンドをなるべく起動しない (tmux への問い合わせ 3 回だけ)。
+# 書いたものは fsync する (ホストごと落ちたときに空のファイルを残さないため)。
+set -u
+
+RESURRECT=/opt/tmux-plugins/tmux-resurrect/scripts/save.sh
+RDIR="$HOME/.local/share/tmux/resurrect"
+STATE="${CLAUDE_PANE_STATE:-$HOME/.local/state/claude-pane}"
+CDIR="$STATE/pane_contents"     # 画面の文字 (hist-<位置>、screen-<位置>)
+CIDX="$STATE/pane_contents.idx" # 位置 → pane_id、取り込んだときの出力の世代・履歴の行数など
+HIST_SLACK=2000                 # 履歴のファイルが tmux の履歴よりこの行数だけ長くなったら、古い行を落とす
+LKEY="$STATE/layout.key"        # 前回書いた構成のうち、変わったら書き直す部分
+LTIME="$STATE/layout.time"      # 前回構成を書いた時刻
+LOG="$STATE/log"
+LOCK="$STATE/save.lock"
+PENDING="$STATE/save.pending"
+KEEP=${TMUX_STATE_KEEP:-120}      # 残す構成のファイルの数
+REFRESH=${TMUX_STATE_REFRESH:-30} # タイトルなど、変わっても即は書かない部分を書き直す間隔 (秒)
+FLAG_TTL=600                      # 復元中の旗の有効期限 (claude-pane と同じ)
+
+T=$'\t'
+US=$'\037'
+
+now_s() { printf -v NOW '%(%s)T' -1; }
+log() {
+  mkdir -p "$STATE"
+  printf '%(%F %T)T %s\n' -1 "$*" >>"$LOG"
+}
+readf() { REPLY=; [ -f "$1" ] && IFS= read -r -d '' REPLY <"$1"; return 0; } # ファイルを丸ごと REPLY に (fork しない)
+
+# 復元中 (claude-pane が立てる @claude_pane_restoring、期限付き) か停止中 (@tmux_state_stopping) か。
+# 1 回の問い合わせで両方読む。BLOCKED_WHY に理由
+blocked() {
+  local r s
+  IFS=$US read -r r s < <(tmux display-message -p "#{@claude_pane_restoring}${US}#{@tmux_state_stopping}" 2>/dev/null)
+  BLOCKED_WHY=
+  if [ -n "${s:-}" ]; then
+    BLOCKED_WHY=stopping
+  elif [ -n "${r:-}" ]; then
+    now_s
+    [ $((NOW - r)) -lt "$FLAG_TTL" ] && BLOCKED_WHY=restoring
+  fi
+  [ -n "$BLOCKED_WHY" ]
+}
+
+# 書き終わった保存か (最後に state 行で終わる)。途中で切れたもの・空のものは偽。
+# pane 行は要件にしない: 利用者がセッションを全部閉じたときの保存も正しい保存 (戻すものが無い)
+valid_save() { [ -s "$1" ] && tail -n1 "$1" | grep -q '^state'; }
+
+is_shell() { case "${1#-}" in bash | sh | dash | zsh | fish | ksh) return 0 ;; esac; return 1; }
+
+# resurrect の restore.sh は -r なしの read で読むので、\ は \\ にする。タブと改行は欄を壊すので空白にする。
+# 結果は E に入れる (毎秒ペインの数だけ呼ぶので、$(...) のサブシェルを作らない)
+esc() { E=${1//\\/\\\\}; E=${E//$T/ }; E=${E//$'\n'/ }; }
+
+# ---- 構成 ----------------------------------------------------------------
+
+# tmux から 1 回ずつ読み、resurrect と同じ形式の本文 (BODY)、変わったらすぐ書く部分 (KEY)、
+# 画面の取り込みに使うペインの一覧 (PANES: 位置 US pane_id US window_activity) を作る。
+# グループ化したセッションがあれば 1 を返す (その場合は resurrect の save.sh に任せる)
+read_tmux() {
+  local pfmt wfmt key="" body="" panes="" line
+  local grouped session window wactive wflags pindex title dir pactive cmd pid id act full name layout auto
+  pfmt="#{session_grouped}${US}#{session_name}${US}#{window_index}${US}#{window_active}${US}#{window_flags}${US}#{pane_index}"
+  pfmt+="${US}#{pane_title}${US}#{pane_current_path}${US}#{pane_active}${US}#{pane_current_command}${US}#{pane_pid}"
+  pfmt+="${US}#{pane_id}${US}#{window_activity}${US}#{pane_output_generation}${US}#{history_added}${US}#{history_generation}${US}#{history_size}"
+  # tmux サーバーの起動時刻。ペインの id (%0 など) はサーバーを起動し直すとまた最初から振られるので、
+  # 前のサーバーのペインの記録と取り違えないよう、id と組にして使う
+  pfmt+="${US}#{start_time}"
+  local ogen hadd hgen hsize srv
+  while IFS=$US read -r grouped session window wactive wflags pindex title dir pactive cmd pid id act ogen hadd hgen hsize srv; do
+    [ "$grouped" = 1 ] && return 1
+    full=
+    # 動いているコマンドの引数 (resurrect が vim などを起動し直すのに使う)。シェルと claude は要らないので読まない
+    if ! is_shell "$cmd" && [ "$cmd" != claude ]; then
+      full=$(ps -o args= --ppid "$pid" 2>/dev/null | head -n1)
+    fi
+    esc "$session"
+    body+="pane${T}${E}${T}${window}${T}${wactive}${T}:${wflags}${T}${pindex}"
+    esc "$title"
+    body+="${T}${E}"
+    esc "$dir"
+    body+="${T}:${E}${T}${pactive}${T}${cmd}"
+    esc "$full"
+    body+="${T}:${E}"$'\n'
+    key+="pane${T}${session}${T}${window}${T}${wactive}${T}${pindex}${T}${dir}${T}${pactive}"$'\n'
+    panes+="${session}:${window}.${pindex}${US}${id}${US}${act}${US}${ogen}${US}${hadd}${US}${hgen}${US}${hsize}${US}${srv}"$'\n'
+  done < <(tmux list-panes -a -F "$pfmt" 2>/dev/null)
+  wfmt="#{session_name}${US}#{window_index}${US}#{window_name}${US}#{window_active}${US}#{window_flags}${US}#{window_layout}${US}#{?automatic-rename,on,off}"
+  while IFS=$US read -r session window name wactive wflags layout auto; do
+    esc "$session"
+    body+="window${T}${E}${T}${window}"
+    esc "$name"
+    body+="${T}:${E}${T}${wactive}${T}:${wflags}${T}${layout}${T}${auto}"$'\n'
+    # automatic-rename のウィンドウ名はコマンドを打つたびに変わるので、即書く理由にしない
+    [ "$auto" = on ] && name=
+    key+="window${T}${session}${T}${window}${T}${name}${T}${wactive}${T}${layout}${T}${auto}"$'\n'
+  done < <(tmux list-windows -a -F "$wfmt" 2>/dev/null)
+  # 最後は必ず state 行 (書き終わった印)。attach している端末が無ければ両方空
+  body+="state${T}${T}"
+  BODY=$body
+  KEY=${key%$'\n'}
+  PANES=$panes
+}
+
+# 構成を書く。書いたら 0
+layout_step() { # force
+  local force=$1 name tmp last_t
+  readf "$LKEY"
+  if [ -z "$force" ] && [ "$KEY" = "$REPLY" ]; then
+    # 並びは同じ。タイトル・コマンドなどだけの違いは REFRESH 秒ごとに書く
+    readf "$LTIME"
+    last_t=${REPLY:-0}
+    now_s
+    [ $((NOW - last_t)) -lt "$REFRESH" ] && return 1
+    readf "$RDIR/last"
+    if [ "$BODY"$'\n' = "$REPLY" ]; then
+      printf '%s' "$NOW" >"$LTIME"
+      return 1
+    fi
+  fi
+  mkdir -p "$RDIR"
+  printf -v name 'tmux_resurrect_%(%Y%m%dT%H%M%S)T.txt' -1
+  tmp=$(mktemp "$RDIR/.layout.XXXXXX") || return 1
+  printf '%s\n' "$BODY" >"$tmp"
+  sync "$tmp"
+  mv -f "$tmp" "$RDIR/$name" # 同じ秒に 2 回書いたら置き換える (resurrect のように消してしまうことはない)
+  ln -sfn "$name" "$RDIR/.last.tmp" && mv -Tf "$RDIR/.last.tmp" "$RDIR/last" # last の差し替えも 1 回の rename で
+  printf '%s' "$KEY" >"$LKEY.tmp" && mv -f "$LKEY.tmp" "$LKEY"
+  now_s
+  printf '%s' "$NOW" >"$LTIME"
+  sync "$RDIR" "$STATE"
+  ls -t "$RDIR"/tmux_resurrect_*.txt 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -f
+  return 0
+}
+
+# グループ化したセッションがあるときだけ使う (resurrect の save.sh。画面の文字の取り込みもする)
+resurrect_save() {
+  # resurrect の保存ファイル名は秒単位。同じ秒に 2 回保存すると、2 回目が last の指すファイルを上書きし、
+  # 「前回と同じ中身」と判定して消してしまう。前回の保存と同じ秒なら、次の秒になるまで待つ。
+  local name
+  while :; do
+    printf -v name 'tmux_resurrect_%(%Y%m%dT%H%M%S)T.txt' -1
+    [ "$(readlink "$RDIR/last" 2>/dev/null)" = "$name" ] || break
+    sleep 0.2
+  done
+  "$RESURRECT" quiet >/dev/null 2>&1
+  sync "$RDIR/last" "$RDIR" 2>/dev/null
+}
+
+# ---- 画面 ----------------------------------------------------------------
+
+# 取り込みは -e (色付き)。resurrect と違い -J (折り返された行を繋ぐ) は付けない: 履歴を行の数で区切って差分を取るので、
+# 1 つの長い行が保存の境目をまたぐと、繋いだ行と範囲の行数がずれて継ぎ目が欠けたり重なったりする。
+# 画面の行のまま保存する (復元先の幅が違うと、長い行が折り返された形で見える)。
+# 数千行になりうるので bash の変数を通さず、直接ファイルへ流す
+trim_tail() { sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'; } # 末尾の空行を落とす
+
+# 履歴 (の全部か増えた分) と見えている画面を、1 回の tmux の呼び出しで取り込む。
+# 1 回にまとめるのは、同じ瞬間の内容にするため: 別々に取り込むと、その間に画面の上へ流れた行がどちらにも入らない。
+# 出力は「1 行目: history_added US history_generation US history_size」「履歴」「区切り」「画面」の順で、
+# awk 1 回で、履歴を $3、画面を $4 の一時ファイルに分ける (どちらも最初に空にする)。HADD・HGEN・HSIZE に 1 行目を入れる。
+# 取り込めなかったら (ペインが無い等) 1 を返す
+SEP="${US}tmux-state-screen${US}"
+#
+# 条件つきの実行 (if-shell -F) は使わない: 中のコマンドが後ろのコマンドより後に実行されることがあり、
+# 履歴の行が区切りの後ろ (画面の側) に出て、次の回で画面を差し替えたときに失われた (負荷をかけたテストで、
+# 最後に追記するはずの数万行が抜けた)。並びの保証が要らない、条件なしのコマンドだけで組む。
+#
+# 増えた分を取るときは、前回の最後の 1 行も含めて「増えた行数 + 1」行を取り込み、重なった先頭の 1 行を落とす。
+# (増えた行数が 0 のときに -S -0 -E -1 になると、tmux は前後を入れ替えて「履歴の最後の 1 行と画面の最初の 1 行」
+#  を返してしまうため、0 にならないようにする)。取り込みと同じ呼び出しで読んだ history_added から、
+# bash の側で増えた行数を出して扱いを決める:
+#   0 以下              取り込んだものは捨てる (履歴は増えていない)
+#   履歴の長さより小さい  先頭の 1 行 (前回の最後の行) を落とす
+#   履歴の長さ以上        取り込んだもの (= いまの履歴の全部) をそのまま使う (上限を超えた分は呼ぶ側が置き換える)
+capture_pane_state() { # id old_added(空なら履歴を全部) hist scr
+  local id=$1 old=$2 range rc n
+  if [ -n "$old" ]; then
+    range="-#{?#{e|<:#{e|+:#{e|-:#{history_added},$old},1},#{history_size}},#{e|+:#{e|-:#{history_added},$old},1},#{history_size}}"
+  else
+    range=-
+  fi
+  tmux display-message -p -t "$id" "#{history_added}${US}#{history_generation}${US}#{history_size}" \; \
+    capture-pane -ep -t "$id" -S "$range" -E -1 \; \
+    display-message -p -t "$id" "$SEP" \; \
+    capture-pane -ep -t "$id" 2>/dev/null |
+    awk -v sep="$SEP" -v meta="$3.meta" -v hist="$3" -v scr="$4" '
+      BEGIN { printf "" > hist; printf "" > scr; printf "" > meta }
+      NR == 1 { print > meta; next }
+      !s && $0 == sep { s = 1; next }
+      { print > (s ? scr : hist) }
+      END { exit (s ? 0 : 1) }'
+  rc=$?
+  HADD= HGEN= HSIZE=
+  IFS=$US read -r HADD HGEN HSIZE <"$3.meta" || rc=1
+  rm -f "$3.meta"
+  [ -n "$HADD" ] || rc=1
+  [ "$rc" = 0 ] || return 1
+  if [ "${HSIZE:-0}" -le 0 ]; then
+    : >"$3" # 履歴が無い (tmux は画面の行を返すことがある)
+  elif [ -n "$old" ]; then
+    n=$((HADD - old))
+    if [ "$n" -le 0 ]; then
+      : >"$3"
+    elif [ "$n" -lt "$HSIZE" ]; then
+      tail -n +2 "$3" >"$3.tail" && mv -f "$3.tail" "$3"
+    fi
+  fi
+  return 0
+}
+
+# 前回から出力があったペイン (と、位置に別のペインが来たところ) だけ取り込む。all なら全部を取り込み直す。
+# 取り込んだペインの数を CAPTURED に入れる。
+#
+# 落ちても食い違わないように、索引 (CIDX) を「確定の印」にする。索引の 1 行は
+#   位置 US pane_id US 出力の世代 US history_added US history_generation US 履歴の行数(概数)
+#   US 履歴のファイル名 US そのうち有効なバイト数 US 画面のファイル名
+# 履歴は有効なバイト数の後ろに追記し、画面は毎回新しい名前のファイルに書き、最後に全ペイン分の索引を
+# rename 1 回で差し替える。差し替える前に落ちれば、復元 (prepare-restore) は前の索引どおり
+# 「履歴は前の長さまで + 前の画面」を使うので、履歴と画面は必ず同じ瞬間のものになる。
+# (以前は履歴への追記と画面の差し替えを別々にしていて、その間に落ちると、画面の上へ流れた行が
+#  履歴と前の画面の両方に入る・どちらにも入らない、が起こりえた)
+contents_step() { # all
+  local all=$1 pos id act ogen hadd hgen hsize okey tmp changed= full stamp
+  local hfile hbytes sfile nfile part scrtmp mode refetch tp srv uid
+  local -A o_id=() o_key=() o_add=() o_gen=() o_lines=() o_hf=() o_hb=() o_sf=() seen=()
+  local idx="" stale=()
+  [ -d "$CDIR" ] || mkdir -p "$CDIR"
+  if [ -f "$CIDX" ]; then
+    while IFS=$US read -r pos id okey hadd hgen tmp hfile hbytes sfile; do
+      o_id[$pos]=$id o_key[$pos]=$okey o_add[$pos]=$hadd o_gen[$pos]=$hgen o_lines[$pos]=$tmp
+      o_hf[$pos]=$hfile o_hb[$pos]=$hbytes o_sf[$pos]=$sfile
+    done <"$CIDX"
+  fi
+  CAPTURED=0
+  stamp=${EPOCHREALTIME/./}
+  part="$CDIR/.part.$$" scrtmp="$CDIR/.screen.$$"
+  while IFS=$US read -r pos id act ogen hadd hgen hsize srv; do
+    [ -n "$pos" ] || continue
+    uid="$srv/$id" # 索引に書く id (tmux サーバーの起動時刻/ペインの id)。tmux に渡すのは id
+    seen[$pos]=1
+    if [ -z "$ogen" ] || [ -z "$hadd" ]; then
+      # tmux 3.8 より前 (書式が無い)。entrypoint が起動時に止めるので、ここには来ないはず
+      log "state: ERROR: tmux $(tmux -V) lacks pane_output_generation/history_added (needs 3.8+); screen contents not saved"
+      return 1
+    fi
+    okey=$ogen
+    if [ -z "$all" ] && [ "${o_id[$pos]:-}" = "$uid" ] && [ "${o_key[$pos]:-}" = "$okey" ]; then
+      idx+="$pos$US$uid$US$okey$US${o_add[$pos]}$US${o_gen[$pos]}$US${o_lines[$pos]}$US${o_hf[$pos]}$US${o_hb[$pos]}$US${o_sf[$pos]}"$'\n'
+      continue
+    fi
+    hfile=${o_hf[$pos]:-} hbytes=${o_hb[$pos]:-0}
+    # 同じペインで履歴の世代も同じなら、増えた分だけ。そうでなければ (初回、別のペインが来た、履歴が消された・
+    # 折り返しが変わった、停止時) 全部を取り込み直す
+    # mode: add 増えた分を追記 / replace 取り込んだ分で履歴を置き換える
+    # refetch: 取り込み直し (初回・別のペイン・履歴の世代が変わった・停止時)。かかった時間は REFETCH_US に足す
+    # (復元の直後などの 1 回きりの取り込み直しで、entrypoint が次の保存を遅らせないように)
+    mode=replace refetch=1 tp=${EPOCHREALTIME/./}
+    # (history_added が前回より小さいなら、別のペインの記録を見ている。念のため取り込み直す)
+    if [ -z "$all" ] && [ -n "$hfile" ] && [ -f "$CDIR/$hfile" ] && [ "${o_id[$pos]:-}" = "$uid" ] && [ "${o_gen[$pos]:-}" = "$hgen" ] &&
+      [ "$hadd" -ge "${o_add[$pos]:-0}" ] &&
+      capture_pane_state "$id" "${o_add[$pos]}" "$part" "$scrtmp" && [ "$HGEN" = "$hgen" ]; then
+      mode=add refetch=
+      # 前回から履歴の上限を超える行が流れたときは、取り込む前に tmux が捨てた行がある。tmux の履歴はいま新しい行だけで
+      # 途切れていないので、保存も古い行に継ぎ足さず、取り込んだ分 (= いまの履歴の全部) で置き換える
+      [ $((HADD - ${o_add[$pos]})) -gt "$HSIZE" ] && mode=replace
+    elif rm -f "$part" "$scrtmp"; ! capture_pane_state "$id" "" "$part" "$scrtmp"; then # 前の取り込みの残りを消してから
+      # 取り込めなかった (ペインがちょうど閉じた等)。このペインは前の確定のまま残す
+      rm -f "$part" "$scrtmp"
+      idx+="$pos$US${o_id[$pos]:-}$US${o_key[$pos]:-}$US${o_add[$pos]:-}$US${o_gen[$pos]:-}$US${o_lines[$pos]:-}$US${o_hf[$pos]:-}$US${o_hb[$pos]:-}$US${o_sf[$pos]:-}"$'\n'
+      continue
+    fi
+    # テスト用: ペインごとの取り込みの記録 (どの方式で、前回と今回の history_added、取り込んだ行の最初と最後)
+    if [ -n "${TMUX_STATE_DEBUG:-}" ]; then
+      printf '%s %s %s mode=%s refetch=%s old_add=%s HADD=%s HSIZE=%s gen=%s/%s part=%s first=[%s] last=[%s] file=%s\n' \
+        "${EPOCHREALTIME}" "$pos" "$uid" "$mode" "${refetch:-}" "${o_add[$pos]:-}" "$HADD" "$HSIZE" "${o_gen[$pos]:-}" "$HGEN" \
+        "$( [ -f "$part" ] && wc -l <"$part" || echo moved)" "$( [ -f "$part" ] && head -n1 "$part" | cut -c1-30)" \
+        "$( [ -f "$part" ] && tail -n1 "$part" | cut -c1-30)" "$hfile" >>"$STATE/capture.trace"
+    fi
+    if [ "$mode" = add ]; then
+      # 確定していない尻尾 (前の回が索引を差し替える前に止まった分) を落としてから追記する
+      truncate -s "$hbytes" "$CDIR/$hfile"
+      # 履歴が増えていないのに何か取り込んでいたら使わない (上の条件で防いでいるが、念のため)
+      [ "$HADD" -gt "${o_add[$pos]}" ] && cat "$part" >>"$CDIR/$hfile"
+      HLINES=$((${o_lines[$pos]:-0} + HADD - ${o_add[$pos]}))
+      if [ "$HLINES" -gt $((HSIZE + HIST_SLACK)) ]; then
+        # 上限で捨てられた古い行を、ときどきまとめて落とす (新しい名前のファイルに書く)
+        nfile="hist-$pos.$stamp"
+        tail -n "$HSIZE" "$CDIR/$hfile" >"$CDIR/$nfile"
+        stale+=("$CDIR/$hfile")
+        hfile=$nfile
+        HLINES=$HSIZE
+      fi
+    else
+      nfile="hist-$pos.$stamp"
+      mv -f "$part" "$CDIR/$nfile"
+      [ -n "$hfile" ] && stale+=("$CDIR/$hfile")
+      hfile=$nfile
+      HLINES=$HSIZE
+    fi
+    rm -f "$part"
+    hbytes=$(stat -c %s "$CDIR/$hfile")
+    sfile="screen-$pos.$stamp"
+    trim_tail <"$scrtmp" >"$CDIR/$sfile"
+    rm -f "$scrtmp"
+    [ -n "${o_sf[$pos]:-}" ] && stale+=("$CDIR/${o_sf[$pos]}")
+    idx+="$pos$US$uid$US$okey$US$HADD$US$HGEN$US$HLINES$US$hfile$US$hbytes$US$sfile"$'\n'
+    CAPTURED=$((CAPTURED + 1))
+    WRITTEN+=("$CDIR/$hfile" "$CDIR/$sfile")
+    changed=1
+    [ -n "$refetch" ] && REFETCH_US=$((REFETCH_US + ${EPOCHREALTIME/./} - tp))
+  done <<<"$PANES"
+  # 無くなった位置のファイルは、索引を差し替えた後で消す
+  for pos in "${!o_id[@]}"; do
+    if [ -z "${seen[$pos]:-}" ]; then
+      [ -n "${o_hf[$pos]:-}" ] && stale+=("$CDIR/${o_hf[$pos]}")
+      [ -n "${o_sf[$pos]:-}" ] && stale+=("$CDIR/${o_sf[$pos]}")
+      changed=1
+    fi
+  done
+  [ -n "$changed" ] || return 0
+  # 確定: 書いたファイルをディスクに落としてから、索引を rename 1 回で差し替える
+  [ ${#WRITTEN[@]} -gt 0 ] && sync "${WRITTEN[@]}" 2>/dev/null
+  tmp="$STATE/.idx.$$"
+  printf '%s' "$idx" >"$tmp"
+  sync "$tmp"
+  mv -f "$tmp" "$CIDX"
+  sync "$STATE" "$CDIR" 2>/dev/null
+  [ ${#stale[@]} -gt 0 ] && rm -f "${stale[@]}"
+  return 0
+}
+
+# ---- まとめ --------------------------------------------------------------
+
+save_once() { # [final]
+  local final=${1:-} t0 laid=
+  WRITTEN=()
+  CAPTURED=0
+  REFETCH_US=0
+  t0=${EPOCHREALTIME/./}
+  # テスト用: 保存の開始と終了の時刻を書き出す (重なっていないことを確かめるため)
+  [ -n "${TMUX_STATE_TRACE:-}" ] && printf 'start %s\n' "$t0" >>"$TMUX_STATE_TRACE"
+  if read_tmux; then
+    layout_step "$final" && laid=1
+    contents_step "$final"
+  else
+    resurrect_save
+    laid=1
+  fi
+  # 位置が変わったら、claude の対応表も新しい位置で書き直す
+  [ -n "$laid$final" ] && CLAUDE_PANE_FINAL=$final claude-pane save
+  [ -n "${TMUX_STATE_TRACE:-}" ] && printf 'end %s\n' "${EPOCHREALTIME/./}" >>"$TMUX_STATE_TRACE"
+  LAST_MS=$(((${EPOCHREALTIME/./} - t0) / 1000))
+  # 間隔の調整に使う時間 (1 回きりの取り込み直しの分を除く)
+  PACE_MS=$((LAST_MS - REFETCH_US / 1000))
+  [ "$PACE_MS" -ge 0 ] || PACE_MS=0
+  # ログは構成を書いたとき、停止時、遅かったときだけ (画面の取り込みは毎秒起きうるので書かない)
+  if [ -n "$laid$final" ] || [ "$LAST_MS" -ge 1000 ]; then
+    log "state: saved${laid:+ layout}, ${CAPTURED} pane(s) captured in ${LAST_MS}ms${final:+ (final)}"
+  fi
+}
+
+cmd_save() {
+  [ -d "$STATE" ] || mkdir -p "$STATE"
+  : >"$PENDING" # 走っている保存がいれば、その保存が終わった後にもう 1 回保存させる
+  if blocked; then
+    log "state: save skipped ($BLOCKED_WHY)"
+    return 0
+  fi
+  exec 9>"$LOCK"
+  flock -n 9 || return 0 # ほかの保存が走っている。そちらが PENDING を見てもう 1 回保存する
+  while [ -e "$PENDING" ]; do
+    rm -f "$PENDING"
+    blocked && return 0
+    save_once
+  done
+  # entrypoint が次の保存までの間隔を決めるのに使う (取り込み直しの時間は除く)
+  printf '%s' "${PACE_MS:-0}" >"$STATE/save.ms"
+}
+
+cmd_final_save() {
+  mkdir -p "$STATE"
+  # 以後、毎秒・フックからの保存と対応表の書き直しを止める (旗は tmux サーバーと一緒に消える)
+  tmux set -g @tmux_state_stopping 1 2>/dev/null || return 0
+  if claude-pane restoring; then
+    log "state: final save skipped (restoring; keep the previous save)"
+    return 0
+  fi
+  exec 9>"$LOCK"
+  flock -w 15 9 || log "state: final save: lock wait timed out, saving anyway"
+  rm -f "$PENDING"
+  save_once final
+}
+
+cmd_prepare_restore() {
+  local cur f tmp
+  # last が中身の無い・途中まで・消えたファイルを指していたら、中身のある最新の保存に向け直す
+  if cur=$(readlink "$RDIR/last" 2>/dev/null) && ! valid_save "$RDIR/$cur"; then
+    for f in $(ls -t "$RDIR"/tmux_resurrect_*.txt 2>/dev/null); do
+      if valid_save "$f"; then
+        ln -sfn "$(basename "$f")" "$RDIR/.last.tmp" && mv -Tf "$RDIR/.last.tmp" "$RDIR/last"
+        log "state: last pointed to a broken save ($cur); now $(basename "$f")"
+        break
+      fi
+    done
+    valid_save "$RDIR/last" || log "state: no valid save found (last -> $cur)"
+  fi
+  # ペインごとの画面の文字 (履歴 + 見えている画面) を繋げ、resurrect の restore.sh が読む形
+  # (pane_contents.tar.gz の中の ./pane_contents/pane-<位置>) にまとめる
+  # 使うのは索引 (確定した内容) に書かれたものだけ: 履歴はそのファイルの有効なバイト数まで + その画面のファイル
+  if [ -d "$CDIR" ] && [ -f "$CIDX" ]; then
+    local work pos id okey hadd hgen lines hfile hbytes sfile
+    local -A keep=()
+    work=$(mktemp -d "$STATE/.restore.XXXXXX")
+    mkdir -p "$work/pane_contents"
+    while IFS=$US read -r pos id okey hadd hgen lines hfile hbytes sfile; do
+      [ -n "$pos" ] && [ -n "$sfile" ] || continue
+      {
+        [ -n "$hfile" ] && head -c "${hbytes:-0}" "$CDIR/$hfile" 2>/dev/null
+        cat "$CDIR/$sfile" 2>/dev/null
+      } >"$work/pane_contents/pane-$pos"
+      keep[$hfile]=1 keep[$sfile]=1
+    done <"$CIDX"
+    tmp=$(mktemp "$RDIR/.contents.XXXXXX")
+    tar cf - -C "$work" ./pane_contents 2>/dev/null | gzip >"$tmp" && mv -f "$tmp" "$RDIR/pane_contents.tar.gz"
+    rm -rf "$work"
+    # 索引に無いファイル (差し替えの前に止まった回の書きかけ、以前の版の名前) を片付ける。
+    # 起動時で、ほかの保存はまだ走っていない
+    for f in "$CDIR"/* "$CDIR"/.part.* "$CDIR"/.screen.*; do
+      [ -e "$f" ] || continue
+      [ -n "${keep[${f##*/}]:-}" ] || rm -f "$f"
+    done
+  fi
+}
+
+case "${1:-}" in
+  save | quiet) cmd_save ;; # quiet: prefix + C-s などから resurrect と同じ引数で呼ばれたとき
+  final-save) cmd_final_save ;;
+  prepare-restore | repair-last) cmd_prepare_restore ;;
+  blocked) blocked ;;
+  *)
+    echo "usage: tmux-state save|final-save|prepare-restore|blocked" >&2
+    exit 2 ;;
+esac

@@ -2,70 +2,120 @@
 
 コンテナ（サンドボックス）が落ちて起動し直したとき、tmux の画面と、各ペインで動いていた Claude Code の会話を、落ちる直前の状態に戻す仕組みです。
 
-## 何を解決するか
+## 何が戻るか
 
 ホストがハングしてコンテナごと止まると、tmux のセッション・ウィンドウ・ペインの並び、各ペインの作業ディレクトリと画面の文字、そして「どのペインでどの Claude の会話をしていたか」がすべて消えます。会話そのものは Claude Code が保存しているので `claude --resume <id>` で再開できますが、どのペインがどの会話だったかは手で思い出すしかありません。
 
 この仕組みを入れると、**止まったコンテナを `docker start` で起動し直すだけで**:
 
-- セッション・ウィンドウ・ペインが同じ並び・同じ作業ディレクトリで戻る
-- 各ペインに表示されていた文字が戻る
+- セッション・ウィンドウ・ペインが同じ並び・同じ作業ディレクトリ・同じ名前で戻る
+- 各ペインに表示されていた文字（スクロールで見える過去の行も含む）が戻る
 - Claude が動いていたペインでは、**そのペインの会話**が元の起動オプション付きで再開される（同じディレクトリで複数並べていても取り違えない。`/clear`・`/resume` で切り替えた後の会話に追従する）
 
-自分で閉じたもの（`/exit` した Claude、閉じたペイン）は戻しません。最初のプロンプト（`claude "…"`）が再送されることもありません。webui などのランチャーには依存せず、コンテナの中だけで完結します。
+戻らないもの:
 
-## 仕組み
+- 自分で閉じたもの（`/exit` した Claude、閉じたペイン・ウィンドウ）
+- 最初のプロンプト（`claude "…"` の `"…"`）。再送はされません
+- `claude -p` などの非対話の実行、`--continue`・`--worktree` など会話や作業場所を新しく作るオプション
+- 落ちる直前、普段は 1 秒程度の変化（出力が非常に多いときは最大 5 秒程度）
 
-保存するものは 3 つです。
-
-| 保存するもの | 中身 | いつ | 担当 |
-|---|---|---|---|
-| 構成 | セッション・ウィンドウ・ペインの並び、作業ディレクトリ、名前 | 変わったとき（作る・閉じるはその場で、`cd` などは 1 秒以内） | `bin/tmux-state` |
-| 画面の文字 | 各ペインに表示されていた文字（スクロールで見える過去の行も含む） | 出力があったペインの増えた行だけ、毎秒 | `bin/tmux-state` |
-| Claude の対応表 | 「この位置のペインでは、この会話を、このオプションで開いていた」 | Claude が起動したとき・会話が切り替わったとき | `bin/claude-pane`（Claude Code の SessionStart / SessionEnd フック） |
-
-起動し直すと、entrypoint が tmux-resurrect で構成と画面の文字を作り直し、対応表を見て、Claude が動いていたペインで `claude <元のオプション> --resume <id>` を実行します。
-
-落ちたときに失うのは、普段は直近 1 秒程度です（1 秒に数万行が流れ続けるような極端な負荷のときは、保存の CPU を抑えるために間隔を空けるので、最大 5 秒程度）。
-
-主な工夫:
-
-- 保存は「書き終わってから 1 回で切り替える」ので、保存の途中で落ちても前の正しい保存が残る。画面の文字の保存が壊れていても、構成と Claude の再開は成功する
-- 復元中・停止中は保存しない。`docker stop`（SIGTERM）では、止まる直前に 1 回だけ保存してから終わる
-- Claude が動いているのに対応表の記録が付かない（フックが動いていない）ペインがあれば、tmux のステータス行に赤い警告を出す
-- 保存する環境変数は名前を決めたものだけ（`bin/claude-pane` 冒頭の `KEEP_ENV` / `DROP_ENV`）。トークン類は残さない
-
-## 構成
-
-```
-session/
-  Dockerfile                          見本と検証用のイメージ (tmux 3.8 をソースからビルド)
-  entrypoint.sh                       起動時の復元、毎秒の保存と見張り、SIGTERM での停止直前の保存 (見本)
-  tmux.conf                           /etc/tmux.conf。tmux-resurrect の読み込みと、構成の変化ですぐ保存する tmux フック
-  bin/tmux-state                      構成と画面の文字の保存
-  bin/claude-pane                     Claude の対応表と再開
-  managed-settings.d/50-claude-pane.json  Claude のフックの登録 (/etc/claude-code/managed-settings.d/)
-test.sh                               テスト (23 の場面、確認項目 110)
-docs/verification-notes.md            検証の経緯・決定事項・結果・本番のチェックリスト
-```
+保存はすべてコンテナの中（`$HOME` の下）に置きます。ボリュームは要りませんが、**コンテナを削除すると保存も消えます**（後述「運用の前提」）。
 
 ## 必要なもの
 
-- tmux **3.8 以上**（ペインごとの出力の番号・履歴の行数の書式と、`pane-exited` などのフックを使う。3.8 未満だと entrypoint が起動を止める）
-- tmux-resurrect（復元にだけ使う。保存は `tmux-state` が resurrect と同じ形式で書く）
-- bash、coreutils、util-linux（`flock`）、procps（`ps`・`pgrep`）
-- Claude Code（フックは管理者用設定 `/etc/claude-code/managed-settings.d/` に置く。利用者が自分の設定を変えても消えない）
+- tmux **3.8 以上**（3.8 未満だと起動時に止まります。Ubuntu 24.04 の標準パッケージは 3.4 なので、ソースからのビルドなどが必要）
+- tmux-resurrect
+- bash、coreutils、util-linux（`flock`）、procps（`ps`・`pgrep`）、findutils（`find`）、sed、grep、awk、tar、gzip（最小構成のイメージでは抜けていることがあります）
+- Claude Code
 
-実際のサンドボックスのイメージに組み込むときは、`session/Dockerfile` と `session/entrypoint.sh` を見本として、上のファイルと entrypoint の復元の部分を組み込みます。本番で確かめることは `docs/verification-notes.md` の「本番コンテナで確認が必要な項目（チェックリスト）」にあります。
+## イメージへの組み込み
 
-## テストを流す
+`session/Dockerfile` と `session/entrypoint.sh` が見本です。次のファイルを置き、entrypoint に 3 つの処理を組み込みます。
+
+| ファイル | 置き場所 |
+|---|---|
+| `session/bin/tmux-state`、`session/bin/claude-pane` | `/usr/local/bin/`（実行権限付き） |
+| `session/tmux.conf` | `/etc/tmux.conf`（既存の設定があれば中身を足す。`set -g exit-empty off` は落とさない。これが無いとセッションが無いときに tmux サーバーが終わり、復元できません） |
+| `session/managed-settings.d/50-claude-pane.json` | `/etc/claude-code/managed-settings.d/` |
+| tmux-resurrect | `/opt/tmux-plugins/tmux-resurrect` |
+
+entrypoint に入れる処理（見本の `entrypoint.sh` の該当部分をそのまま使えます）:
+
+1. **起動時の復元**: `tmux start-server` で tmux サーバーを起動し、保存があれば `tmux-state prepare-restore` の後に `tmux run-shell /opt/tmux-plugins/tmux-resurrect/scripts/restore.sh` を実行する。restore.sh はシェルから直接呼ばず、必ず `tmux run-shell` 経由で呼ぶ（tmux の中で動く前提のスクリプトです）。tmux-continuum の自動復元は使わない
+2. **毎秒の保存と見張り**: tmux サーバーが生きている間、`tmux-state save` を毎秒、`claude-pane save` と `claude-pane check` を 10 秒ごとに呼ぶ
+3. **停止直前の保存**: SIGTERM を受けたら `tmux-state final-save` してから `tmux kill-server`
+
+Claude Code のフックは管理者用設定（`/etc/claude-code/managed-settings.d/`）に置くので、利用者が自分の設定を変えても消えません。
+
+見本の entrypoint は、初回起動時にセッション `main` を作って `claude` を起動します。モデルと追加の引数は環境変数 `CLAUDE_MODEL`・`CLAUDE_EXTRA_ARGS` で渡せます。webui などが別の名前のセッションに attach する場合は、そこを合わせてください。
+
+本番に入れる前に確かめることは [`docs/production-checklist.md`](docs/production-checklist.md) にまとめてあります。
+
+## 運用の前提
+
+- **コンテナは削除せず、止まったものを `docker start` で起動し直す**。`docker rm` やイメージ更新での作り直しをすると、会話・tmux の保存がすべて消えます。イメージを更新するときの扱いは別に決めてください
+- **停止の猶予を十分に取る**。`docker stop` では停止直前に 1 回保存してから終わります。かかる時間はペイン数と履歴の長さに比例します（100 ペイン × 5,000 行で約 5 秒）。`docker stop -t`、compose の `stop_grace_period` などをそれより長くしてください
+- **PID 1 に SIGTERM が届くこと**。`tini`・`dumb-init`・シェルのラッパーを挟む場合、entrypoint まで SIGTERM が届くか確かめてください
+- ホストが戻ったときにコンテナを自動で起動し直すなら、`restart` ポリシー（`unless-stopped` など）を設定します
+
+## 落ちたとき
+
+止まったコンテナを起動し直すだけです。
 
 ```bash
-cp .env.example .env            # CLAUDE_CODE_OAUTH_TOKEN= の行に書く (.env は git に入れない)。環境変数で渡してもよい
-./test.sh 2>&1 | tee test.log   # イメージのビルドから、テスト専用コンテナの作成・削除まで自動。全体で約 45 分
+docker start <コンテナ名>
 ```
 
-- テスト専用のコンテナ（既定 `claude-pane-test`）を `session/` のイメージから作り、ボリュームは付けません。主な場面は「`docker kill` → 同じコンテナを `docker start` → 復元される」です。
-- Claude は haiku で 1 往復ずつ呼びます。
-- `./test.sh t1 t13` で一部だけ、`KEEP=1` でコンテナを残す、`REUSE=1` で残したコンテナを使う、`STRESS_ITER=50` でストレステストの回数を変える、`TMUX_STATE_DEBUG=1` で画面の取り込みの記録（`~/.local/state/claude-pane/capture.trace`）を出す。
-- Linux（Ubuntu 24.04）と Windows の Git Bash の両方で動きます。手順の詳細は `docs/verification-notes.md` の「Ubuntu 24.04 で再テストする手順」。
+起動すると構成と画面の文字が戻り、Claude が動いていたペインでは `claude <元のオプション> --resume <id>` が自動で打ち込まれます。復元中は保存を止め、終わったら再開します。
+
+- 会話ファイルが見つからない（起動しただけで何もしていなかった）ペインは、新しい会話で Claude を起動します
+- `/clear` した直後に落ちた場合は、空の会話で再開します
+- 復元のたびに、ペインの画面の文字はその前の内容の後ろに積み重なります（既知の挙動）
+- 端末の幅が保存時と違うと、長い行は折り返された形で表示されます
+
+手で今すぐ保存したいときは prefix + C-s です（普段は自動で保存されるので不要です）。
+
+## 状態の確かめ方
+
+ログは `~/.local/state/claude-pane/log` にあります（2,000 行を超えると古い行を削り、最新の 1,000 行を残します）。
+
+| ログ | 意味 |
+|---|---|
+| `hook: %N source=startup sid=…` | ペインの Claude の会話を記録した（`source=resume`・`clear` は再開・切り替え） |
+| `state: saved layout, N pane(s) captured in Nms` | 構成を保存した。`(final)` が付くのは停止直前の保存 |
+| `restore: <位置>: started sid=… (resume)` | 復元で、そのペインの会話を再開した |
+| `restore: <位置>: no transcript for …` | 会話ファイルが無いので新しい会話で起動した |
+| `WARN: <位置>: claude … without a SessionStart record` | フックが動いておらず、その Claude の会話は戻らない |
+| `restore: unknown option dropped: …` | 知らない起動オプションを、再開時に外した |
+| `state: last pointed to a broken save …` | 最新の保存が途中で切れていたので、中身のある保存のうち最も新しいものから戻した |
+
+フックが動いていない Claude があると、tmux のステータス行の右に赤く `claude 未記録: <位置>` と出ます。そのときは:
+
+- Claude で `/status` を開き、`Setting sources` に `Enterprise managed settings` が出ているか（`managed-settings.json` も置いている環境では `(file + drop-ins)` と出ることを確認済み。drop-in だけの環境での表示は未確認）
+- 組織の `managed-settings.json` に `disableAllHooks: true` が無いか、`/etc/claude-code/managed-settings.d/` が配布で消えていないか
+- `claude --bare` など、フックを読まない起動のしかたをしていないか
+
+## 設定
+
+| 何を | どこで | 既定 |
+|---|---|---|
+| 保存して復元時に戻す環境変数 | `bin/claude-pane` 冒頭の `KEEP_ENV`（名前の正規表現） | `RC_*`、`CLAUDE_MODEL`、`CLAUDE_CONFIG_DIR` |
+| 上のうち保存しないもの | `bin/claude-pane` 冒頭の `DROP_ENV` | 名前に TOKEN・SECRET・PASSWORD・PASSWD・KEY・CREDENTIAL を含むもの |
+| フック未動作の警告を出すまでの秒数 | 環境変数 `CLAUDE_PANE_CHECK_GRACE` | 60 |
+| 残す構成の保存ファイルの数 | 環境変数 `TMUX_STATE_KEEP` | 120 |
+| 保存の間隔の上限（負荷が高いとき） | `entrypoint.sh` の `SAVE_MAX_GAP` | 5 秒 |
+
+環境変数の値は保存先に平文で残ります。**トークンなどの秘密を `KEEP_ENV` に入れないでください。**
+
+## 保存先
+
+| 場所 | 中身 |
+|---|---|
+| `~/.local/share/tmux/resurrect/` | 構成の保存（`tmux_resurrect_*.txt`）と、最新を指す `last` |
+| `~/.local/state/claude-pane/` | ペインと会話の対応表（`map`）、画面の文字、ログ |
+| `~/.claude/` | Claude Code の会話そのもの |
+| `~/.claude.json` | Claude Code の設定（ディレクトリの信頼など） |
+
+## ライセンス
+
+MIT（[LICENSE](LICENSE)）

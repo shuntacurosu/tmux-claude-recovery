@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux + Claude Code の会話の復元を確かめる。中身と期待値は docs/verification-notes.md の「ステップ3: テストケース」。
+# tmux + Claude Code の会話の復元を確かめる。各テストの意図は tN() の行のコメント、期待値は check の説明。
 #
 # テスト専用のコンテナ (既定 claude-pane-test) を session/ のイメージから作って使う。
 # 本番と同じく、ボリュームは付けない (コンテナを消さない限り中のファイルが残ることに頼る)。
